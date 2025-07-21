@@ -1,0 +1,5 @@
+CJK_CHARACTERS = r"\u4e00-\u9fff"
+CJK_NUM = "零○〇一二三四五六七八九十百千萬壹貳參肆伍陸柒捌玖拾"
+VALID_TEXT = r"[a-zA-Z0-9\u4e00-\u9fff.,!?;:()「」『』。，、！？：；（）《》]"
+HTML_PATTERN = r"<[^>]+>(.*?)</[^>]+>"
+HTML_TAG = r"(<[^>]+>|</[^>]+>)"

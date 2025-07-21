@@ -1,0 +1,39 @@
+[project]
+name = "pdf-to-docx"
+version = "0.1.0"
+description = ""
+authors = [{ name = "xiaolong70701", email = "xiaolong70701@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+pillow = "^10.2.0"
+pdf2image = "^1.17.0"
+pytesseract = "^0.3.13"
+torch = "^2.7.1"
+markdown2docx = "^0.1.0"
+tqdm = "^4.67.1"
+surya-ocr = "^0.14.6"
+pymupdf = "^1.26.1"
+openai = "^1.90.0"
+rich-argparse = "^1.7.1"
+json-files-compare = "^1.0.1"
+jsoncomparison = "^1.1.0"
+
+[tool.poetry]
+packages = [{ include = "pdf_to_docx" }]
+
+
+[tool.poetry.group.dev.dependencies]
+pre-commit = "^4.2.0"
+black = "^22.10.0"
+isort = "^5.10.1"
+autopep8 = "^2.0.0"
+autoflake = "^1.7.8"
+pytest = "^7.2.0"
+mypy = "1.5.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

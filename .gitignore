@@ -1,0 +1,45 @@
+# ==========================================
+# Python bytecode and compiled artifacts
+# ==========================================
+__pycache__/
+*.py[cod]
+*.so
+*.pyc
+*.pyd
+*.pyo
+
+!requirements_xpu.txt
+TODO.md
+
+# ==========================================
+# Environment and package metadata
+# ==========================================
+.env
+.venv/
+
+# ==========================================
+# Editor and system files
+# ==========================================
+.vscode/
+.DS_Store
+
+# ==========================================
+# Output and intermediate data
+# ==========================================
+logs/
+data/
+temp/
+output/
+*.log
+
+# ==========================================
+# Ignore batch/output but keep batch/script/*
+# ==========================================
+batch/*
+
+# ==========================================
+# Cache folders inside tests or custom modules
+# ==========================================
+tests/__pycache__/
+pdf_ocr/__pycache__/
+batch/__pycache__
