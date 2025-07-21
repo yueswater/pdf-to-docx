@@ -217,8 +217,8 @@ class PDFBatchTest:
                 continue
 
             if "ocr" in mode:
-                self.mode_record[pdf_path.name] = "OCR_SKIPPED"
-                continue
+                self.mode_record[pdf_path.name] = "OCR"
+                # continue
             elif "text" in mode:
                 self.mode_record[pdf_path.name] = "PDF"
 

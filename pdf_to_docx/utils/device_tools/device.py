@@ -40,5 +40,5 @@ def get_best_device() -> torch.device:
     else:
         device = torch.device("cpu")
 
-    logging.critical(f"Working on system {system} with device: {device}")
+    logging.critical(f"Working on system {system} with device: {device}\n")
     return device
