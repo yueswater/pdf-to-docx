@@ -35,7 +35,7 @@ output/
 # ==========================================
 # Ignore batch/output but keep batch/script/*
 # ==========================================
-batch/*
+
 
 # ==========================================
 # Cache folders inside tests or custom modules
