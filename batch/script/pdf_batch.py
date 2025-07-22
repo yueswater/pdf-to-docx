@@ -183,8 +183,6 @@ class PDFBatchTest:
         info_path = self.base_output_dir / "files_info.json"
         record_path = self.base_output_dir / f"{self.version_name}_result.json"
 
-        record = {}
-
         try:
             with open(info_path, encoding="utf-8") as f:
                 infos = json.load(f)
@@ -217,8 +215,8 @@ class PDFBatchTest:
                 continue
 
             if "ocr" in mode:
-                self.mode_record[pdf_path.name] = "OCR"
-                # continue
+                self.mode_record[pdf_path.name] = "OCR_SKIPPED"
+                continue
             elif "text" in mode:
                 self.mode_record[pdf_path.name] = "PDF"
 

@@ -97,6 +97,28 @@ class StrategySelector:
         else:
             return OCRLayerStrategy()
 
+@dataclass
+class PageNumberLocator:
+    reference_text: str
+    reference_box: List[Tuple[float, float]]  # polygon of first detected page number
+    tolerance: float = 20.0  # 可以自定義 XY 容忍範圍
+
+    def is_same_position(self, box: List[Tuple[float, float]]) -> bool:
+        def get_center(polygon):
+            xs = [p[0] for p in polygon]
+            ys = [p[1] for p in polygon]
+            return sum(xs) / len(xs), sum(ys) / len(ys)
+
+        cx1, cy1 = get_center(self.reference_box)
+        cx2, cy2 = get_center(box)
+
+        return abs(cx1 - cx2) <= self.tolerance and abs(cy1 - cy2) <= self.tolerance
+
+    def is_similar_text(self, text: str) -> bool:
+        return self.reference_text.strip() == text.strip()
+
+    def match(self, text: str, box: List[Tuple[float, float]]) -> bool:
+        return self.is_same_position(box)
 
 @dataclass
 class PDFTextExtractor:
@@ -120,6 +142,8 @@ class PDFTextExtractor:
     ocr_page_number_boxes: Dict = field(default_factory=dict)
     ocr_page_info: Dict = field(default_factory=dict)
     ocr_page_numbers: Dict = field(default_factory=dict)
+
+    page_locator: Optional[PageNumberLocator] = field(default=None)
 
     # Parameters setting
     EPSILON: float = 1e-3  # tolerence of block criterion
@@ -226,7 +250,7 @@ class PDFTextExtractor:
         try:
             for i, page in enumerate(self.doc):
                 blocks = page.get_text("blocks")
-                _, pagenum_blocks, pagenum_texts = self.detect_pagenums(blocks, page.rect.height)
+                _, pagenum_blocks, pagenum_texts = self.detect_pagenums(blocks, page.rect.height, i)
 
                 # Save page number block and page number content
                 # TODO: Don't save only the first one, you may be able to tell if you hate multiple pages (RESOLVED)
@@ -494,54 +518,40 @@ class PDFTextExtractor:
         refined_boxes, refined_texts = zip(*[(b, t) for b, t in selected_blocks]) if selected_blocks else ([], [])
         return list(refined_boxes), list(refined_texts)
 
-    def filter_pagenum(self, lines: List, get_text: Callable, get_polygon: Callable, page_height: int) -> Tuple[List, List, List]:
+    def filter_pagenum(
+        self,
+        lines: List,
+        get_text: Callable,
+        get_polygon: Callable,
+        page_height: int
+    ) -> Tuple[List, List, List]:
         kept_lines = []
         pn_boxes = []
         pn_texts = []
-        all_lines = []
 
-        # Calculate y-axis centers among blocks
-        y_centers = np.array([(get_polygon(line)[0][1] + get_polygon(line)[2][1]) / 2 for line in lines])
+        for line in lines:
+            text = get_text(line).strip()
+            polygon = get_polygon(line)
 
-        y_min, y_max = min(y_centers).tolist(), max(y_centers).tolist()
+            # 初始化 page_locator（若尚未建立）
+            if self.page_locator is None:
+                for pattern, _ in self.PAGENUM_PATTERNS:
+                    if re.fullmatch(pattern, text):
+                        self.page_locator = PageNumberLocator(reference_text=text, reference_box=polygon)
+                        break
 
-        mean_y = np.mean(y_centers)
-        std_y = np.std(y_centers)
-
-        body_range = (
-            y_min + self.BIN_SIZE,
-            y_max - self.BIN_SIZE
-        )
-
-        for line, y in zip(lines, y_centers):
-            text = get_text(line)
-            matched = False
-
-            all_lines.append({
-                "text": text,
-                "y_value": round(y.tolist(), 3)
-            })
-
-            for subtext in text.splitlines():
-                if self.is_line_pn(
-                    text=subtext,
-                    y=y,
-                    body_range=body_range,
-                    image_height=page_height,
-                    mean_y=mean_y,
-                    std_y=std_y,
-                    all_lines=all_lines
-                ):
-                    pn_boxes.append(get_polygon(line))
-                    pn_texts.append(subtext)
-                    matched = True
-                    # break
-            if not matched:
+            # 若符合定位器的文字與位置
+            if self.page_locator and self.page_locator.match(text, polygon):
+                pn_boxes.append(polygon)
+                pn_texts.append(text)
+            else:
                 kept_lines.append(line)
 
+        # 過濾重複位置的頁碼區塊
         pn_boxes, pn_texts = self.refine_pagenum_blocks(pn_boxes, pn_texts, page_height)
 
         return kept_lines, pn_boxes, pn_texts
+
 
     @staticmethod
     def convert_block_to_pseudoline(blocks: List[Tuple]) -> List[PseudoLine]:
@@ -557,15 +567,61 @@ class PDFTextExtractor:
             pseudo_lines.append(PseudoLine(text=text, polygon=polygon))
         return pseudo_lines
 
-    def detect_pagenums(self, blocks: List[Tuple], page_height: int) -> Tuple[List, List, List]:
+    def detect_pagenums(self, blocks: List[Tuple], page_height: int, page_index: int) -> Tuple[List, List, List]:
         pseudo_lines = self.convert_block_to_pseudoline(blocks)
         if not pseudo_lines:
             return [], [], []
 
-        return self.filter_pagenum(lines=pseudo_lines, get_polygon=lambda l: l.polygon, get_text=lambda l: l.text, page_height=page_height)
+        # 第一次建立 page locator
+        if self.page_locator is None:
+            for line in pseudo_lines:
+                text = line.text
+                for pattern, _ in self.PAGENUM_PATTERNS:
+                    if re.fullmatch(pattern, text.strip()):
+                        self.page_locator = PageNumberLocator(text, line.polygon)
+                        if self.debug:
+                            logging.debug(f"[PageLocator Init] ref_text: {text}, box: {line.polygon}")
+                        break
+                if self.page_locator is not None:
+                    break
+
+        # 第二次全部走定位比對
+        pn_boxes, pn_texts, kept_lines = [], [], []
+        for line in pseudo_lines:
+            if self.page_locator and self.page_locator.match(line.text, line.polygon):
+                if self.debug:
+                    logging.debug(f"[Match] Page {page_index}, matched text: {line.text}")
+                pn_boxes.append(line.polygon)
+                pn_texts.append(line.text)
+            else:
+                if self.debug:
+                    logging.debug(f"[No Match] Page {page_index}, text: {line.text}")
+                kept_lines.append(line)
+
+        return kept_lines, pn_boxes, pn_texts
+
 
     def detect_ocr_pagenums(self, ocr_result: List[TextLine], image_height: int) -> Tuple[List, List, List]:
-        return self.filter_pagenum(lines=ocr_result, get_polygon=lambda l: l.polygon, get_text=lambda l: l.text, page_height=image_height)
+        pn_boxes, pn_texts, kept_lines = [], [], []
+
+        for line in ocr_result:
+            text = line.text.strip()
+            polygon = line.polygon
+
+            # 第一次建立定位器
+            if self.page_locator is None:
+                for pattern, _ in self.PAGENUM_PATTERNS:
+                    if re.fullmatch(pattern, text):
+                        self.page_locator = PageNumberLocator(text, polygon)
+                        break
+
+            if self.page_locator and self.page_locator.match(text, polygon):
+                pn_boxes.append(polygon)
+                pn_texts.append(text)
+            else:
+                kept_lines.append(line)
+
+        return kept_lines, pn_boxes, pn_texts
 
     def original_pdf(self, output_path: Path) -> None:
         self.doc.save(output_path)
