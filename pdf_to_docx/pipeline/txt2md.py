@@ -124,7 +124,16 @@ class TextToMarkdown:
             for line in raw.splitlines()
         ]
         return cls(input_path=input_path, output_path=output_path, lines=lines)
-
+    
+    @classmethod
+    def is_structured_headline(cls, text: str) -> bool:
+        for conf in cls.LEVEL_PATTERNS.values():
+            pattern = conf["pattern"]
+            matcher = pattern.match if conf["function"] == "match" else pattern.search
+            if matcher(text.strip()):
+                return True
+        return False
+    
     @with_pattern("chapter")
     def _split_chapter_title(self, _: str, match) -> List[str]:
         groups = match.groups()

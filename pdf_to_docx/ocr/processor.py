@@ -26,6 +26,9 @@ from pdf_to_docx.parsing.text_cleaner import TextCleaner
 from pdf_to_docx.utils.device_tools.device import get_best_device
 from pdf_to_docx.utils.text_tools.text_patterns import HTML_PATTERN
 from pdf_to_docx.utils.validation.valid_pdf import valid_pdf
+from pdf_to_docx.utils.geometry_tools import geometry
+from pdf_to_docx.pipeline.txt2md import TextToMarkdown
+from pdf_to_docx.parsing.text_cleaner import TextCleaner
 from PIL import Image
 from PIL import ImageDraw
 from surya.detection import DetectionPredictor
@@ -121,6 +124,11 @@ class PDFTextExtractor:
     ocr_page_info: Dict = field(default_factory=dict)
     ocr_page_numbers: Dict = field(default_factory=dict)
 
+    global_coord_groups: Dict[int, List[Tuple]] = field(default_factory=dict)
+    next_group_id: int = 0
+
+    pagenum_ratio_threshold: float = 0.5
+
     # Parameters setting
     EPSILON: float = 1e-3  # tolerence of block criterion
     DPI: int = 200
@@ -130,6 +138,7 @@ class PDFTextExtractor:
     CONFIDENCE_LEVEL: float = 0.5  # confidence of the block being a valid sentence
     SHORT_LINE_NUM: int = 8
     PAGE_NUM_BOX_WIDTH: float = 1.0
+    IOU_THRESHOLD: float = 0.5
 
     # Open pdf file
     doc: fitz.Document = field(init=False)
@@ -160,6 +169,10 @@ class PDFTextExtractor:
         (r"^\d{1,4}/\d{1,4}$", "分數格式"),
         (r"^[\u4e00-\u9fa5]{1,4}\s*\d{1,3}$", "中文短詞 + 數字結尾"),
         (r".*[\u4e00-\u9fa5]{1,4}[-‐－—]\d{1,3}$", "短詞-數字格式（含多種破折號）"),
+        (r"^[\u4e00-\u9fa5]{1,4}\s*\d{1,3}[-‐－—]\d{1,3}$", "中文短詞 + 數字-數字"),
+        (r"^[\s\u4e00-\u9fa5A-Za-z\-－—]{2,}-\d{1,3}(\s+\d{2,4}\.\d{2}\s*版)?\s*$", "詞組破折號數字 + 可選後綴"),
+        (r"^[\u4e00-\u9fa5A-Za-z\-－—]+-\d+(?:\s+)?\d{3}\.\d{2}版?$", "長中文-數字混合頁碼"),
+        (r"^附件\s*\d{1,3}\s*$", "附件頁碼")
     ]
 
     NON_PAGENUM_PATTERNS: ClassVar[List[Tuple[str, str]]] = [
@@ -168,6 +181,7 @@ class PDFTextExtractor:
         (r"^\d+(\.\d+)+$", "多層章節號格式，如 2.1.3、5.1.2.3"),
         (r"^[A-Z]+\d{2,}$", "英文代碼與數字結尾，如 R088、T100"),
         (r"^[A-Z]{1,3}-[A-Z]{1,3}-\d+$", "英文模組代號，如 DOC-INT-001"),
+        (r"^第\s*[一二三四五六七八九十百千\d]+\s*條$", "法律條文「第X條」格式")
     ]
 
     def __call__(self, detect_only: bool = False):  # Can be called as a function
@@ -217,25 +231,69 @@ class PDFTextExtractor:
         bx1 = max(p[0] for p in polygon)
         by1 = max(p[1] for p in polygon)
         return abs(x0 - bx0) < 1 and abs(y0 - by0) < 1 and abs(x1 - bx1) < 1 and abs(y1 - by1) < 1
+    
+    @staticmethod
+    def _normalize_pagenum_text(text: str) -> str:
+        # Clear all blanks (including full-shaped blanks \u3000)
+        return re.sub(r"[\s\u3000]+", "", text)
+    
+    def _is_similar_pagenum_text(self, t1: str, t2: str) -> bool:
+        norm1 = self._normalize_pagenum_text(t1)
+        norm2 = self._normalize_pagenum_text(t2)
+        for pattern, _ in self.PAGENUM_PATTERNS:
+            if re.match(pattern, norm1) and re.match(pattern, norm2):
+                return True
+        return False
 
     def extract_from_pdf(self) -> List[str]:
         """
         Extract full text directly from a PDF file.
+        Only retain page numbers that appear in consistent positions across multiple pages.
         """
         full_text = []
         try:
+            # Prescan each page and create a page number candidate block group
             for i, page in enumerate(self.doc):
                 blocks = page.get_text("blocks")
-                _, pagenum_blocks, pagenum_texts = self.detect_pagenums(blocks, page.rect.height)
+                self.detect_pagenums(blocks, page.rect.height, page_index=i)
 
-                # Save page number block and page number content
-                # TODO: Don't save only the first one, you may be able to tell if you hate multiple pages (RESOLVED)
-                if pagenum_blocks:
-                    self.pagenum_blocks[i] = pagenum_blocks
-                    self.page_numbers[i] = [TextCleaner.get_page_line(t) for t in pagenum_texts]
-                    self.pagenum_info[i] = [{"box": b, "text": t} for b, t in zip(pagenum_blocks, pagenum_texts)]
+            # Page group filtering: Only groups appearing on multiple pages are retained
+            if self.doc.page_count > 1:
+                total_pages = self.doc.page_count
 
-                # Create page text
+                valid_groups = []
+                for group_id, group in self.global_coord_groups.items():
+                    polygons = [
+                        f"[{round(min(p[0] for p in g[0]), 1)}, {round(min(p[1] for p in g[0]), 1)}, "
+                        f"{round(max(p[0] for p in g[0]), 1)}, {round(max(p[1] for p in g[0]), 1)}]" 
+                        for g in group
+                    ]
+                    texts = {g[1] for g in group}
+                    pages = {g[2] for g in group}
+                    ratio = len(pages) / total_pages
+                    logging.debug(
+                        f"[PAGE NUM GROUP] Group {group_id}: appears on {len(pages)} pages (ratio={ratio:.3f}), "
+                        f"texts={texts}, pages={sorted(pages)}, polygons={polygons} → {'✅ keep' if ratio >= self.pagenum_ratio_threshold else '❌ drop'}"
+                    )
+                    if ratio >= self.pagenum_ratio_threshold:
+                        valid_groups.append(group)
+            else:
+                valid_groups = list(self.global_coord_groups.values())
+
+            # Create page number information for each page
+            for polygon, text, page_index, _ in [g for group in valid_groups for g in group]:
+                self.pagenum_blocks.setdefault(page_index, []).append(polygon)
+                self.page_numbers.setdefault(page_index, []).append(TextCleaner.get_page_line(text))
+                self.pagenum_info.setdefault(page_index, []).append({
+                    "box": polygon,
+                    "text": text,
+                })
+
+            #Second scan: Extract text and exclude valid page number blocks
+            for i, page in enumerate(self.doc):
+                blocks = page.get_text("blocks")
+                pagenum_blocks = self.pagenum_blocks.get(i, [])
+
                 page_text = ""
                 for block in blocks:
                     if any(self.is_same_block(block, polygon) for polygon in pagenum_blocks):
@@ -247,9 +305,12 @@ class PDFTextExtractor:
 
             if self.auto_clean:
                 self.clean_up()
+
         except Exception as e:
             logging.exception("Failed on running extract from PDF: %s", e)
+
         return full_text
+
 
     def extract_from_ocr(self) -> List[str]:
         """
@@ -278,7 +339,7 @@ class PDFTextExtractor:
                 image_height = image.height
 
                 # Check if a line contains page number
-                kept_lines, ocr_pn_boxes, ocr_page_numbers = self.detect_ocr_pagenums(ocr_result, image_height)
+                kept_lines, ocr_pn_boxes, ocr_page_numbers = self.detect_ocr_pagenums(ocr_result, image_height, page_index=i)
 
                 if ocr_pn_boxes:
                     self.ocr_page_number_boxes[i] = ocr_pn_boxes
@@ -337,111 +398,61 @@ class PDFTextExtractor:
                     normalized.append({"text": part, "y_value": y})
         return normalized
 
-    # TODO: 改為找到同一份文件頁碼的位置，判斷是否與既有的 coord 有交集，並看一下是否符合頁碼格式
-    def is_line_pn(self, text: str, y: float, image_height: int, body_range: Tuple, mean_y: float, std_y: float, all_lines: List[Dict[str, Any]]) -> bool:
-        # print(image_height)
+    # TODO: Instead, find the location of the page number of the same file, determine whether it has intersection with the existing coord, and see if it meets the page number format
+    def is_line_pn(
+        self,
+        text: str,
+        y: float,
+        image_height: int,
+        body_range: tuple,
+        mean_y: float,
+        std_y: float,
+    ) -> bool:
         text = text.strip()
-        body_range = tuple(sorted(body_range))
-        all_lines = self.normalize_lines(all_lines)
 
-        # Direct exclusion of non-page number formats
-        if any(re.fullmatch(pattern, text) for pattern, _ in self.NON_PAGENUM_PATTERNS):
+        if TextToMarkdown.is_structured_headline(text):
             return False
-        if self.is_html_contains_num(text):
-            return True
-        if max(body_range) - min(body_range) <= self.MARGIN:
-            return True
+        if text.isdigit() and len(text) <= 3:
+            is_pagenum_format = re.search(r"(第\s*\d+\s*頁|Page\s+\d+|\d+\s*/\s*\d+)", text)
+            if not is_pagenum_format and not (y < image_height * 0.25 or y > image_height * 0.75):
+                return False
 
-        # Preprocessing
+        # Remove the tag and continue to make general judgments
         text = TextCleaner.remove_html_tag(text)
         text = TextCleaner.remove_dashes(text).strip()
-        phrases = re.split(r"[，,。:：\s]+", text)
 
-        # Position
-        in_body = body_range[0] <= y <= body_range[1]
-        is_top_or_bottom = y < image_height * 0.25 or y > image_height * 0.75
         z = abs(y - mean_y) / max(std_y, self.EPSILON)
+        # Necessary condition
+        is_top_or_bottom = y < image_height * 0.25 or y > image_height * 0.75
+        is_page_number = any(re.search(p[0], text) for p in self.PAGENUM_PATTERNS)
+        necessary_cond = is_top_or_bottom and is_page_number
+        
+        if not necessary_cond:
+            return False
 
-        # Scan each phrase to see if there are decent page numbers
-        for phrase in phrases:
-            # If empty, skip
-            if not phrase:
-                continue
+        # Sufficient condition
+        z = abs(y - mean_y) / max(std_y, self.EPSILON)
+        add_score = sum(
+            [
+                z > self.Z_THRESHOLD,  # outlier
+                not (body_range[0] <= y <= body_range[1]),  # not in body
+                text.isdigit(),  # pure digit
+                bool(re.search(r"\d+\s*$", text)),  # end with number
+                bool(re.match(r"^[ivxlcdmIVXLCDM]+$", text)),  # roman numeral
+            ]
+        )
 
-            # If it is too long, split the text block
-            phrase = phrase.strip()
+        if add_score >= 1:
+            logging.debug(f"[PAGE_NUM?] '{text}' -> score: {add_score}, z={z:.2f}, y={y:.1f}")
 
-            # Exclude common formats
-            if re.search(r"\d{4}/\d{1,2}/\d{1,2}", phrase):  # 2025/04/21
-                continue
-            if re.search(r"\d{2}:\d{2}(:\d{2})?", phrase):  # 10:48 or 10:48:57
-                continue
-            if re.search(r"\d{3}[./．]\d{2}[./．]\d{2}", phrase):  # 111.06.17
-                continue
+        logging.debug(f"\nText: {text}")
+        logging.debug(f"Length: {len(text)}")
+        logging.debug(f"Position top and bottom: {is_top_or_bottom}")
+        logging.debug(f"Required Conditions: {necessary_cond}")
+        logging.debug(f"Extra score: {add_score}")
+        logging.debug(f"Judgement result: {necessary_cond and add_score >= 1}")
 
-            for pattern, _ in self.NON_PAGENUM_PATTERNS:
-                if re.fullmatch(pattern, phrase):
-                    return False
-
-            if any(re.fullmatch(p[0], phrase) for p in self.PAGENUM_PATTERNS):
-                rounded_y = round(y, 3)
-                same_y_lines = [line for line in all_lines if round(line["y_value"], 3) == rounded_y]
-                if len(same_y_lines) > 1:
-                    for line in same_y_lines:
-                        other_text = line["text"]
-                        if other_text.strip() == text.strip():
-                            continue
-                        if not any(re.fullmatch(p[0], other_text.strip()) for p in self.PAGENUM_PATTERNS):
-                            if self.debug:
-                                logging.debug(f"y 值為 {rounded_y} 的多行中包含非頁碼樣式「{other_text.strip()}」，略過頁碼判斷")
-                            return False
-
-                score: float = 0.0
-
-                # bonus points: It looks really like a page number
-                if re.search(r"第\s*\d+\s*頁\s*/\s*共\s*\d+\s*頁", phrase):
-                    score += 2.0
-
-                # Points deducted: Don't look like a page
-                if re.search(r"[a-zA-Z]{2,}", phrase) and not re.fullmatch(r"[ivxlcdmIVXLCDM]+", phrase):
-                    score -= 1.0
-                if re.search(r"[年月日][:：]", phrase):
-                    score -= 1.0
-                if re.search(r"[^\w\s/]", phrase):
-                    score -= 0.5
-
-                if in_body:
-                    score -= 0.8
-                else:
-                    score += 1.2
-
-                score += 0.8 if z > self.Z_THRESHOLD else 0
-                # score += 0.6 if is_top_or_bottom else 0
-
-                weight = 1 / (1 + math.exp(-(z - 1.5))) # sigmoid
-                score += weight * 1.2
-                score += min(z, 2.0) * 0.2
-
-                score += 1.2 if phrase.isdigit() and len(phrases) == 1 and len(phrase) <= 2 else 0
-                score += 0.3 if re.fullmatch(r"[ivxlcdmIVXLCDM]+", phrase) else 0
-                score += 0.4 if re.fullmatch(r"第?\s*\d{1,3}\s*頁", phrase) else 0
-
-                line_info = self.print_line_info(
-                    text,
-                    y=y,
-                    z=z,
-                    in_body=in_body,
-                    weight=weight,
-                    score=score,
-                    is_page_num=score>=2.0
-                )
-
-                if self.debug:
-                    logging.debug(line_info)
-                if score >= 1.8:
-                    return True
-
-        return False
+        return add_score >= 1
 
     @staticmethod
     def box_contains(a, b):
@@ -494,54 +505,82 @@ class PDFTextExtractor:
         refined_boxes, refined_texts = zip(*[(b, t) for b, t in selected_blocks]) if selected_blocks else ([], [])
         return list(refined_boxes), list(refined_texts)
 
-    def filter_pagenum(self, lines: List, get_text: Callable, get_polygon: Callable, page_height: int) -> Tuple[List, List, List]:
+    def filter_pagenum(self, lines: List, get_text: Callable, get_polygon: Callable, page_height: int, page_index: int) -> Tuple[List, List, List]:
         kept_lines = []
         pn_boxes = []
         pn_texts = []
-        all_lines = []
+        
+        coord_groups = {}
+        groud_id = 0
 
-        # Calculate y-axis centers among blocks
+        # Calculate y-axis centers & body range
         y_centers = np.array([(get_polygon(line)[0][1] + get_polygon(line)[2][1]) / 2 for line in lines])
-
         y_min, y_max = min(y_centers).tolist(), max(y_centers).tolist()
-
         mean_y = np.mean(y_centers)
         std_y = np.std(y_centers)
-
-        body_range = (
-            y_min + self.BIN_SIZE,
-            y_max - self.BIN_SIZE
-        )
+        body_range = (y_min + self.BIN_SIZE, y_max - self.BIN_SIZE)
 
         for line, y in zip(lines, y_centers):
             text = get_text(line)
+            polygon = get_polygon(line)
             matched = False
 
-            all_lines.append({
-                "text": text,
-                "y_value": round(y.tolist(), 3)
-            })
-
             for subtext in text.splitlines():
-                if self.is_line_pn(
+                is_page_num = self.is_line_pn(
                     text=subtext,
                     y=y,
                     body_range=body_range,
                     image_height=page_height,
                     mean_y=mean_y,
                     std_y=std_y,
-                    all_lines=all_lines
-                ):
+                )
+                if is_page_num:
                     pn_boxes.append(get_polygon(line))
                     pn_texts.append(subtext)
                     matched = True
-                    # break
+                    added = False
+                    for _, group in self.global_coord_groups.items():
+                        if any(geometry.compute_iou(polygon, other_block[0]) > self.IOU_THRESHOLD for other_block in group):
+                            group.append((polygon, subtext, page_index, "unknown"))
+                            added = True
+                            break
+                    if not added:
+                        # fallback
+                        merged_by_pattern = False
+                        for gid, group in self.global_coord_groups.items():
+                            if any(
+                                self._is_similar_pagenum_text(subtext, existing_text) or
+                                self._is_similar_pagenum_text(existing_text, subtext)
+                                for _, existing_text, _, _ in group
+                            ):
+                                group.append((polygon, subtext, page_index, "fallback-text-match"))
+                                logging.debug(f" → Fallback merged with Group {gid} by text pattern match: {subtext!r}")
+                                merged_by_pattern = True
+                                break
+
+                        if not merged_by_pattern:
+                            self.global_coord_groups[self.next_group_id] = [(polygon, subtext, page_index, "unknown")]
+                            logging.debug(f" → New group #{self.next_group_id} created with: {subtext!r}, polygon={polygon}")
+                            self.next_group_id += 1
+
+                    break
             if not matched:
                 kept_lines.append(line)
 
+        if self.doc.page_count > 1:
+            valid_groups = [
+                group for group in self.global_coord_groups.values()
+                if len(set(g[2] for g in group)) > 1
+            ]
+        else:
+            valid_groups = list(coord_groups.values())
+
+        pn_boxes = [g[0] for group in valid_groups for g in group]
+        pn_texts = [g[1] for group in valid_groups for g in group]
+
         pn_boxes, pn_texts = self.refine_pagenum_blocks(pn_boxes, pn_texts, page_height)
 
-        return kept_lines, pn_boxes, pn_texts
+        return kept_lines, [], []
 
     @staticmethod
     def convert_block_to_pseudoline(blocks: List[Tuple]) -> List[PseudoLine]:
@@ -557,15 +596,22 @@ class PDFTextExtractor:
             pseudo_lines.append(PseudoLine(text=text, polygon=polygon))
         return pseudo_lines
 
-    def detect_pagenums(self, blocks: List[Tuple], page_height: int) -> Tuple[List, List, List]:
+    def detect_pagenums(self, blocks: List[Tuple], page_height: int, page_index: int) -> Tuple[List, List, List]:
         pseudo_lines = self.convert_block_to_pseudoline(blocks)
         if not pseudo_lines:
             return [], [], []
 
-        return self.filter_pagenum(lines=pseudo_lines, get_polygon=lambda l: l.polygon, get_text=lambda l: l.text, page_height=page_height)
+        # The page number content is not returned here, and the processing is delayed
+        return self.filter_pagenum(
+            lines=pseudo_lines,
+            get_polygon=lambda l: l.polygon,
+            get_text=lambda l: l.text,
+            page_height=page_height,
+            page_index=page_index
+        )
 
-    def detect_ocr_pagenums(self, ocr_result: List[TextLine], image_height: int) -> Tuple[List, List, List]:
-        return self.filter_pagenum(lines=ocr_result, get_polygon=lambda l: l.polygon, get_text=lambda l: l.text, page_height=image_height)
+    def detect_ocr_pagenums(self, ocr_result: List[TextLine], image_height: int, page_index: int) -> Tuple[List, List, List]:
+        return self.filter_pagenum(lines=ocr_result, get_polygon=lambda l: l.polygon, get_text=lambda l: l.text, page_height=image_height, page_index=page_index)
 
     def original_pdf(self, output_path: Path) -> None:
         self.doc.save(output_path)
